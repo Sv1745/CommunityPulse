@@ -223,7 +223,7 @@ export default function AddEventPage() {
           <div className="flex items-center mb-6">
             <Button
               variant="ghost"
-              onClick={() => router.push("/events")}
+              onClick={() => router.push("/home")}
               className="flex items-center text-teal-600 hover:text-teal-800"
             >
               <ArrowLeft className="w-5 h-5 mr-2" />
