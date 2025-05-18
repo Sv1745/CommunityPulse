@@ -1,12 +1,12 @@
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Query
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Annotated
 from datetime import datetime, timedelta
 import jwt
 import os
-from passlib.context import CryptContext
+import logging
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
@@ -17,23 +17,34 @@ from fastapi.responses import JSONResponse
 import shutil
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
+import requests
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration
 DATABASE_URL = "sqlite:///./community_pulse.db"
-SECRET_KEY = "your-secret-key-for-jwt-token"  # Change this in production
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+CLERK_SECRET_KEY = "sk_test_OTSjCgK3YwYAPsR9y8NDjbmJOAlDy6pogqa4MHxL3u"  # Replace with your Clerk secret key
+CLERK_PEM_PUBLIC_KEY = """
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA42smZzN37TQeHCCWIHom
+HEqntoKVVHYJYSFg5+qIYRVRb4GVrNDMmPfcrUKT/S7Hw3wOsr0AFBPVjAXPQmF3
+e05STUh8zh0pTHFJFb72ythK9TUl9zpMa61gU6I6zxnpsXiN37Pn5MoC2raWyyUr
+MvmnL0YM2sgE2v02gk/VIR3uWQuD3kS/heVNfZTuREV6pWyw3M//ywNwl/2sG7pX
+iGZvHBlAGPXVP61cjDhSj+Hlvyd8kOfFKJh3Dwa0WgEF0rGke8ksdOmYZOFfm/ba
+r/s7K4mjQRxZVr2cHBcYVKxiK+/gG8SvJ8MKhyE2PDP1ae6vZfB6YI9THUSMUfHF
+8wIDAQAB
+-----END PUBLIC KEY-----
+"""  # Replace with your Clerk JWT public key
+
+# Define admin email
+ADMIN_EMAIL = "rohithvishwanath1789@gmail.com"
 
 # Database setup
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
-
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# OAuth2 setup
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # Create app
 app = FastAPI(title="Community Pulse API")
@@ -59,15 +70,18 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # Serve static files
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
+# Clerk authentication
+security = HTTPBearer()
+
 # Database Models
 class User(Base):
     __tablename__ = "users"
     
     id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
+    clerk_id = Column(String, unique=True, index=True)
+    username = Column(String, index=True)
     email = Column(String, unique=True, index=True)
     phone = Column(String)
-    password_hash = Column(String)
     is_admin = Column(Boolean, default=False)
     is_verified_organizer = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -94,6 +108,7 @@ class Event(Base):
     is_approved = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    attendees_count = Column(Integer, default=0)
     
     # Relationships
     organizer = relationship("User", back_populates="events")
@@ -130,6 +145,27 @@ class Notification(Base):
 # Create all tables
 Base.metadata.create_all(bind=engine)
 
+# Setup admin user on startup
+@app.on_event("startup")
+async def setup_admin():
+    db = SessionLocal()
+    try:
+        # Find user by email
+        admin_user = db.query(User).filter(User.email == ADMIN_EMAIL).first()
+        
+        if admin_user:
+            # Set as admin if not already
+            if not admin_user.is_admin:
+                admin_user.is_admin = True
+                db.commit()
+                logger.info(f"User {admin_user.email} set as admin")
+        else:
+            logger.info(f"Admin user {ADMIN_EMAIL} not found in database yet")
+    except Exception as e:
+        logger.error(f"Error setting up admin user: {e}")
+    finally:
+        db.close()
+
 # Dependency to get DB session
 def get_db():
     db = SessionLocal()
@@ -139,31 +175,17 @@ def get_db():
         db.close()
 
 # Pydantic Models (Request & Response Models)
-class UserCreate(BaseModel):
-    username: str
-    email: EmailStr
-    phone: str
-    password: str
-
-class UserLogin(BaseModel):
-    username: str
-    password: str
-
 class UserResponse(BaseModel):
     id: int
+    clerk_id: str
     username: str
     email: str
-    phone: str
+    phone: Optional[str] = None
     is_admin: bool
     is_verified_organizer: bool
     
     class Config:
         from_attributes = True
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    user: UserResponse
 
 class EventCreate(BaseModel):
     title: str
@@ -200,6 +222,7 @@ class EventResponse(BaseModel):
     is_approved: bool
     created_at: datetime
     updated_at: datetime
+    attendees_count: int
     
     class Config:
         from_attributes = True
@@ -228,50 +251,103 @@ class AdminUserUpdate(BaseModel):
     is_verified_organizer: Optional[bool] = None
     is_banned: Optional[bool] = None
 
-# Helper functions
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+# Clerk authentication helpers
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
+    token = credentials.credentials
+    
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-    except jwt.PyJWTError:
-        raise credentials_exception
-    
-    user = db.query(User).filter(User.username == username).first()
-    if user is None:
-        raise credentials_exception
-    
-    if user.is_banned:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User is banned from the platform"
+        # Verify the token with Clerk, with leeway for iat validation
+        payload = jwt.decode(
+            token, 
+            key=CLERK_PEM_PUBLIC_KEY, 
+            algorithms=['RS256'],
+            options={"verify_iat": False}
         )
-    
-    return user
+        clerk_user_id = payload.get("sub")
+        if not clerk_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Get or create user in our database
+        user = db.query(User).filter(User.clerk_id == clerk_user_id).first()
+        
+        if not user:
+            # Fetch user details from Clerk
+            headers = {
+                "Authorization": f"Bearer {CLERK_SECRET_KEY}",
+                "Content-Type": "application/json"
+            }
+            clerk_user_response = requests.get(
+                f"https://api.clerk.dev/v1/users/{clerk_user_id}",
+                headers=headers
+            )
+            
+            if clerk_user_response.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Failed to verify user with Clerk",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            
+            clerk_user_data = clerk_user_response.json()
+            
+            # Create a new user in our database
+            primary_email = next((email for email in clerk_user_data.get("email_addresses", []) 
+                                    if email.get("id") == clerk_user_data.get("primary_email_address_id")), {})
+            
+            email_address = primary_email.get("email_address", "")
+            
+            # Check if this is the admin email
+            is_admin = email_address == ADMIN_EMAIL
+            
+            user = User(
+                clerk_id=clerk_user_id,
+                username=clerk_user_data.get("username") or f"user_{clerk_user_id}",
+                email=email_address,
+                phone=clerk_user_data.get("phone_number", ""),
+                is_admin=is_admin
+            )
+            
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            
+            logger.info(f"Created new user: {user.email}, admin: {user.is_admin}")
+        else:
+            # Check if this is the admin email and update if needed
+            if user.email == ADMIN_EMAIL and not user.is_admin:
+                user.is_admin = True
+                db.commit()
+                db.refresh(user)
+                logger.info(f"Updated user {user.email} to admin status")
+        
+        if user.is_banned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User is banned from the platform"
+            )
+        
+        return user
+        
+    except jwt.PyJWTError as e:
+        logger.error(f"JWT error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication error"
+        )
 
-def get_admin_user(current_user: User = Depends(get_current_user)):
+async def get_admin_user(current_user: User = Depends(get_current_user)):
+    logger.info(f"Admin check for user: {current_user.email}, is_admin: {current_user.is_admin}")
     if not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -279,68 +355,9 @@ def get_admin_user(current_user: User = Depends(get_current_user)):
         )
     return current_user
 
-# Auth endpoints
-@app.post("/register", response_model=UserResponse)
-def register_user(user: UserCreate, db: Session = Depends(get_db)):
-    # Check if username or email already exists
-    db_user = db.query(User).filter(
-        (User.username == user.username) | (User.email == user.email)
-    ).first()
-    
-    if db_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username or email already registered"
-        )
-    
-    # Create new user
-    hashed_password = get_password_hash(user.password)
-    db_user = User(
-        username=user.username,
-        email=user.email,
-        phone=user.phone,
-        password_hash=hashed_password
-    )
-    
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    
-    return db_user
-
-@app.post("/login", response_model=Token)
-def login(form_data: UserLogin, db: Session = Depends(get_db)):
-    # Find user by username
-    user = db.query(User).filter(User.username == form_data.username).first()
-    
-    if not user or not verify_password(form_data.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    if user.is_banned:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User is banned from the platform"
-        )
-    
-    # Create access token
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user": user
-    }
-
 # User endpoints
 @app.get("/users/me", response_model=UserResponse)
-def read_users_me(current_user: User = Depends(get_current_user)):
+async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
 
 # Event endpoints
@@ -375,7 +392,8 @@ async def create_event(
         registration_start=registration_start_dt,
         registration_end=registration_end_dt,
         organizer_id=current_user.id,
-        is_approved=current_user.is_verified_organizer  # Auto-approve for verified organizers
+        is_approved=current_user.is_verified_organizer,  # Auto-approve for verified organizers
+        attendees_count=0
     )
     
     # Handle image upload if provided
@@ -394,6 +412,8 @@ async def create_event(
     db.add(db_event)
     db.commit()
     db.refresh(db_event)
+    
+    logger.info(f"Created event: {db_event.id}, approved: {db_event.is_approved}")
     
     return db_event
 
@@ -420,6 +440,8 @@ def get_events(
     
     # Sort by start date
     events = query.order_by(Event.start_date).all()
+    
+    logger.info(f"Fetched {len(events)} events (approved_only={approved_only})")
     
     return events
 
@@ -527,7 +549,7 @@ async def update_event(
     return event
 
 @app.delete("/events/{event_id}")
-def delete_event(
+async def delete_event(
     event_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -574,10 +596,10 @@ def delete_event(
 
 # Event Registration endpoints
 @app.post("/events/{event_id}/register", response_model=EventRegistrationResponse)
-def register_for_event(
+async def register_for_event(
     event_id: int,
     registration: EventRegistrationCreate,
-    current_user: Optional[User] = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     # Fetch event
@@ -618,7 +640,7 @@ def register_for_event(
     # Create registration
     db_registration = EventRegistration(
         event_id=event_id,
-        user_id=current_user.id if current_user else None,
+        user_id=current_user.id,
         attendee_name=registration.attendee_name,
         attendee_email=registration.attendee_email,
         attendee_phone=registration.attendee_phone,
@@ -626,27 +648,80 @@ def register_for_event(
     )
     
     db.add(db_registration)
+    
+    # Update attendees count
+    event.attendees_count = event.attendees_count + registration.number_of_attendees
+    
     db.commit()
     db.refresh(db_registration)
     
     # Create reminder notification
-    if current_user:
-        reminder_date = event.start_date - timedelta(days=1)
-        if reminder_date > now:
-            notification = Notification(
-                event_id=event.id,
-                user_id=current_user.id,
-                title="Event Reminder",
-                message=f"Reminder: The event '{event.title}' is tomorrow!",
-                notification_type="reminder"
-            )
-            db.add(notification)
-            db.commit()
+    reminder_date = event.start_date - timedelta(days=1)
+    if reminder_date > now:
+        notification = Notification(
+            event_id=event.id,
+            user_id=current_user.id,
+            title="Event Reminder",
+            message=f"Reminder: The event '{event.title}' is tomorrow!",
+            notification_type="reminder"
+        )
+        db.add(notification)
+        db.commit()
     
     return db_registration
 
+@app.post("/events/{event_id}/interest")
+async def mark_interest(
+    event_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Fetch event
+    event = db.query(Event).filter(Event.id == event_id).first()
+    
+    if not event:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Event not found"
+        )
+    
+    if not event.is_approved:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot show interest in an unapproved event"
+        )
+    
+    # Check if already registered
+    existing_registration = db.query(EventRegistration).filter(
+        EventRegistration.event_id == event_id,
+        EventRegistration.user_id == current_user.id
+    ).first()
+    
+    if existing_registration:
+        # Remove interest
+        db.delete(existing_registration)
+        event.attendees_count = max(0, event.attendees_count - 1)
+        db.commit()
+        return {"message": "Interest removed successfully"}
+    else:
+        # Create a simple registration to mark interest
+        db_registration = EventRegistration(
+            event_id=event_id,
+            user_id=current_user.id,
+            attendee_name=current_user.username,
+            attendee_email=current_user.email,
+            attendee_phone=current_user.phone or "",
+            number_of_attendees=1
+        )
+        
+        db.add(db_registration)
+        event.attendees_count = event.attendees_count + 1
+        db.commit()
+        
+        return {"message": "Interest marked successfully"}
+
 @app.get("/events/{event_id}/registrations", response_model=List[EventRegistrationResponse])
-def get_event_registrations(
+async def get_event_registrations(
     event_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -675,15 +750,16 @@ def get_event_registrations(
 
 # Admin endpoints
 @app.get("/admin/events/pending", response_model=List[EventResponse])
-def get_pending_events(
+async def get_pending_events(
     admin_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db)
 ):
     events = db.query(Event).filter(Event.is_approved == False).all()
+    logger.info(f"Found {len(events)} pending events for admin {admin_user.email}")
     return events
 
 @app.put("/admin/events/{event_id}/approve")
-def approve_event(
+async def approve_event(
     event_id: int,
     admin_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db)
@@ -699,10 +775,12 @@ def approve_event(
     event.is_approved = True
     db.commit()
     
+    logger.info(f"Admin {admin_user.email} approved event {event_id}")
+    
     return {"message": "Event approved successfully"}
 
 @app.put("/admin/events/{event_id}/reject")
-def reject_event(
+async def reject_event(
     event_id: int,
     admin_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db)
@@ -719,10 +797,12 @@ def reject_event(
     db.delete(event)
     db.commit()
     
+    logger.info(f"Admin {admin_user.email} rejected event {event_id}")
+    
     return {"message": "Event rejected and deleted successfully"}
 
 @app.get("/admin/users", response_model=List[UserResponse])
-def get_all_users(
+async def get_all_users(
     admin_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db)
 ):
@@ -730,7 +810,7 @@ def get_all_users(
     return users
 
 @app.put("/admin/users/{user_id}")
-def update_user_status(
+async def update_user_status(
     user_id: int,
     user_update: AdminUserUpdate,
     admin_user: User = Depends(get_admin_user),
@@ -757,8 +837,29 @@ def update_user_status(
     
     return {"message": "User updated successfully"}
 
+@app.put("/admin/users/{user_id}/verify-organizer")
+async def verify_organizer(
+    user_id: int,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    user.is_verified_organizer = True
+    db.commit()
+    
+    logger.info(f"Admin {admin_user.email} verified user {user.email} as organizer")
+    
+    return {"message": "User verified as organizer successfully"}
+
 @app.get("/admin/events/user/{user_id}", response_model=List[EventResponse])
-def get_user_events(
+async def get_user_events(
     user_id: int,
     admin_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db)
@@ -768,7 +869,7 @@ def get_user_events(
 
 # My events endpoint (for users to see their own events)
 @app.get("/my-events", response_model=List[EventResponse])
-def get_my_events(
+async def get_my_events(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -777,7 +878,7 @@ def get_my_events(
 
 # My registrations endpoint
 @app.get("/my-registrations", response_model=List[EventRegistrationResponse])
-def get_my_registrations(
+async def get_my_registrations(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -789,7 +890,7 @@ def get_my_registrations(
 
 # Notifications endpoints
 @app.get("/notifications")
-def get_notifications(
+async def get_notifications(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -801,7 +902,7 @@ def get_notifications(
     return notifications
 
 @app.put("/notifications/{notification_id}/read")
-def mark_notification_as_read(
+async def mark_notification_as_read(
     notification_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -839,6 +940,77 @@ def search_events(
     ).order_by(Event.start_date).all()
     
     return events
+
+# Clerk webhook endpoint for syncing user data
+@app.post("/clerk-webhook")
+async def clerk_webhook(request: Request, db: Session = Depends(get_db)):
+    # Verify webhook signature (in production, you should validate the webhook signature)
+    payload = await request.json()
+    event_type = payload.get("type")
+    
+    if event_type == "user.created" or event_type == "user.updated":
+        data = payload.get("data", {})
+        clerk_user_id = data.get("id")
+        
+        if not clerk_user_id:
+            return {"status": "error", "message": "Invalid webhook payload"}
+        
+        # Get or create user
+        user = db.query(User).filter(User.clerk_id == clerk_user_id).first()
+        
+        # Extract primary email
+        primary_email_id = data.get("primary_email_address_id")
+        email_addresses = data.get("email_addresses", [])
+        primary_email = next((email.get("email_address") for email in email_addresses 
+                           if email.get("id") == primary_email_id), None)
+        
+        if not user and primary_email:
+            # Check if this is the admin email
+            is_admin = primary_email == ADMIN_EMAIL
+            
+            # Create new user
+            user = User(
+                clerk_id=clerk_user_id,
+                username=data.get("username") or f"user_{clerk_user_id}",
+                email=primary_email,
+                phone=data.get("phone_numbers", [{}])[0].get("phone_number", "") if data.get("phone_numbers") else "",
+                is_admin=is_admin
+            )
+            db.add(user)
+            logger.info(f"Created new user from webhook: {primary_email}, admin: {is_admin}")
+        elif user and primary_email:
+            # Update existing user
+            user.username = data.get("username") or user.username
+            user.email = primary_email
+            
+            # Check if this is the admin email
+            if primary_email == ADMIN_EMAIL and not user.is_admin:
+                user.is_admin = True
+                logger.info(f"Updated user to admin status: {primary_email}")
+                
+            if data.get("phone_numbers"):
+                user.phone = data.get("phone_numbers", [{}])[0].get("phone_number", "") or user.phone
+        
+        db.commit()
+        
+        return {"status": "success", "message": "User data synced"}
+    
+    elif event_type == "user.deleted":
+        data = payload.get("data", {})
+        clerk_user_id = data.get("id")
+        
+        if not clerk_user_id:
+            return {"status": "error", "message": "Invalid webhook payload"}
+        
+        # Find and mark user as deleted or handle as needed
+        user = db.query(User).filter(User.clerk_id == clerk_user_id).first()
+        if user:
+            user.is_banned = True  # Or implement your own deletion policy
+            db.commit()
+        
+        return {"status": "success", "message": "User deletion handled"}
+    
+    return {"status": "success", "message": "Webhook received"}
 
 if __name__ == "__main__":
     import uvicorn

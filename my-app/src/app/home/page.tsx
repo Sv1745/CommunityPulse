@@ -29,7 +29,7 @@ export default function EventsPage() {
   const [events, setEvents] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [category, setCategory] = useState(null);
+  const [category, setCategory] = useState<string | null>(null);
   const { getToken, isLoaded, isSignedIn } = useAuth();
 
   // Fetch events from the backend
@@ -120,19 +120,48 @@ export default function EventsPage() {
             `${API_URL}/events?${params.toString()}`
           );
 
-          const formattedEvents = response.data.map((event) => ({
-            id: event.id,
-            title: event.title,
-            date: new Date(event.start_date).toISOString().split("T")[0],
-            location: event.location,
-            startTime: new Date(event.start_date).toTimeString().slice(0, 5),
-            endTime: new Date(event.end_date).toTimeString().slice(0, 5),
-            description: event.description,
-            category: event.category,
-            attendees: event.registrations?.length || 0,
-            image_path: event.image_path,
-            is_approved: event.is_approved,
-          }));
+          interface EventData {
+            id: number;
+            title: string;
+            start_date: string;
+            end_date: string;
+            location: string;
+            description: string;
+            category: string;
+            registrations?: any[];
+            image_path: string;
+            is_approved: boolean;
+          }
+
+          interface FormattedEvent {
+            id: number;
+            title: string;
+            date: string;
+            location: string;
+            startTime: string;
+            endTime: string;
+            description: string;
+            category: string;
+            attendees: number;
+            image_path: string;
+            is_approved: boolean;
+          }
+
+          const formattedEvents: FormattedEvent[] = response.data.map(
+            (event: EventData) => ({
+              id: event.id,
+              title: event.title,
+              date: new Date(event.start_date).toISOString().split("T")[0],
+              location: event.location,
+              startTime: new Date(event.start_date).toTimeString().slice(0, 5),
+              endTime: new Date(event.end_date).toTimeString().slice(0, 5),
+              description: event.description,
+              category: event.category,
+              attendees: event.registrations?.length || 0,
+              image_path: event.image_path,
+              is_approved: event.is_approved,
+            })
+          );
 
           setEvents(formattedEvents);
         } catch (err) {
@@ -226,10 +255,75 @@ export default function EventsPage() {
   }, [isLoaded, isSignedIn, getToken]);
 
   // Filter events by category
-  const handleCategorySelect = (selectedCategory) => {
+  interface CategorySelectHandler {
+    (selectedCategory: string): void;
+  }
+
+  const handleCategorySelect: CategorySelectHandler = (selectedCategory) => {
     setCategory(selectedCategory);
   };
 
+  interface MarkInterestHandler {
+    (eventId: number): Promise<void>;
+  }
+
+  interface Event {
+    id: number;
+    title: string;
+    date: string;
+    location: string;
+    startTime: string;
+    endTime: string;
+    description: string;
+    category: string;
+    attendees: number;
+    image_path: string;
+    is_approved: boolean;
+    userInterested?: boolean;
+  }
+
+  const markInterest: MarkInterestHandler = async (eventId) => {
+    if (!isSignedIn) {
+      alert("Please sign in to mark interest in this event");
+      return;
+    }
+
+    try {
+      const token = await getToken();
+
+      const response = await fetch(`${API_URL}/events/${eventId}/interest`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to mark interest");
+      }
+
+      const data = await response.json();
+
+      // Toggle the interest status and update the events list
+      setEvents(
+        events.map((event) => {
+          if (event.id === eventId) {
+            const isCurrentlyInterested = event.userInterested || false;
+            return {
+              ...event,
+              userInterested: !isCurrentlyInterested,
+              attendees: isCurrentlyInterested
+                ? event.attendees - 1
+                : event.attendees + 1,
+            };
+          }
+          return event;
+        })
+      );
+    } catch (err) {
+      console.error("Error marking interest:", err);
+    }
+  };
   // Filter events based on search term (client-side filtering as backup)
   const filteredEvents =
     searchTerm.length > 0
@@ -316,11 +410,33 @@ export default function EventsPage() {
                 </SignedOut>
               </MenubarContent>
             </MenubarMenu>
+            <MenubarMenu>
+              <MenubarTrigger>Admin</MenubarTrigger>
+              <MenubarContent>
+                <SignedIn>
+                  <MenubarItem>
+                    <Link href="/admind" className="flex w-full">
+                      Dashboard
+                    </Link>
+                  </MenubarItem>
+                  <MenubarItem>
+                    <Link href="/admind" className="flex w-full">
+                      Organizer Panel
+                    </Link>
+                  </MenubarItem>
+                </SignedIn>
+                <SignedOut>
+                  <MenubarItem>
+                    <SignInButton>Sign in as admin to view</SignInButton>
+                  </MenubarItem>
+                </SignedOut>
+              </MenubarContent>
+            </MenubarMenu>
           </Menubar>
 
           <div className="flex items-center gap-4">
             <SignedIn>
-              <Link href="/events/create">
+              <Link href="/addevent">
                 <Button className="hidden md:flex items-center gap-2">
                   <PlusCircle size={16} />
                   Create Event
@@ -395,7 +511,7 @@ export default function EventsPage() {
             </p>
           </div>
         ) : (
-          <EventCardsGrid events={filteredEvents} />
+          <EventCardsGrid events={filteredEvents} onInterest={markInterest} />
         )}
       </main>
     </div>
