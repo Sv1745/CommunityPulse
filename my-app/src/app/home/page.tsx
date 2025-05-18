@@ -338,7 +338,7 @@ export default function EventsPage() {
   return (
     <div className="min-h-screen flex flex-col">
       <header className="border-b">
-        <div className="container mx-auto flex justify-between items-center py-4">
+        <div className="container mx-auto flex justify-between items-center py-4 px-4">
           <div className="flex items-center gap-2">
             <h1 className="text-xl font-bold">Community Pulse</h1>
           </div>
@@ -471,10 +471,7 @@ export default function EventsPage() {
               <Calendar size={16} />
               All Categories
             </Button>
-            <Button variant="outline" className="flex items-center gap-2">
-              <MapPin size={16} />
-              Location
-            </Button>
+
             <Button variant="outline" className="flex items-center gap-2">
               <Users size={16} />
               Upcoming
