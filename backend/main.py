@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import jwt
 import os
 import logging
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, validator
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
@@ -23,8 +23,8 @@ import requests
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
-DATABASE_URL = "sqlite:///./community_pulse.db"
+
+DATABASE_URL = "postgresql://postgres:rv@localhost:5432/CommunityPulse"
 CLERK_SECRET_KEY = "sk_test_OTSjCgK3YwYAPsR9y8NDjbmJOAlDy6pogqa4MHxL3u"  # Replace with your Clerk secret key
 CLERK_PEM_PUBLIC_KEY = """
 -----BEGIN PUBLIC KEY-----
@@ -120,9 +120,8 @@ class EventRegistration(Base):
     id = Column(Integer, primary_key=True, index=True)
     event_id = Column(Integer, ForeignKey("events.id", ondelete="CASCADE"))
     user_id = Column(Integer, ForeignKey("users.id"))
-    attendee_name = Column(String)
-    attendee_email = Column(String)
-    attendee_phone = Column(String)
+    status = Column(String, default="interested")  # "interested", "registered", "cancelled"
+    attendees = Column(Text)  # JSON string containing array of attendee names
     number_of_attendees = Column(Integer, default=1)
     registered_at = Column(DateTime, default=datetime.utcnow)
     
@@ -223,23 +222,39 @@ class EventResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     attendees_count: int
+    is_registered: Optional[bool] = None
     
     class Config:
         from_attributes = True
 
 class EventRegistrationCreate(BaseModel):
-    attendee_name: str
-    attendee_email: EmailStr
-    attendee_phone: str
-    number_of_attendees: int = 1
+    number_of_attendees: int = Field(ge=1, description="Number of attendees must be at least 1")
+    attendees: List[str] = Field(
+        ...,
+        min_items=1,
+        description="List of attendee names"
+    )
+
+    @validator("attendees")
+    def validate_attendees(cls, v):
+        if not all(name.strip() for name in v):
+            raise ValueError("Attendee names cannot be empty")
+        if len(v) > 10:
+            raise ValueError("Maximum 10 attendees allowed per registration")
+        return v
+
+    @validator("number_of_attendees")
+    def validate_number_of_attendees(cls, v, values):
+        if "attendees" in values and v != len(values["attendees"]):
+            raise ValueError("Number of attendees must match the length of attendees list")
+        return v
 
 class EventRegistrationResponse(BaseModel):
     id: int
     event_id: int
     user_id: Optional[int] = None
-    attendee_name: str
-    attendee_email: str
-    attendee_phone: str
+    status: str
+    attendees: List[str]
     number_of_attendees: int
     registered_at: datetime
     
@@ -628,7 +643,7 @@ async def register_for_event(
     # Check if already registered
     existing_registration = db.query(EventRegistration).filter(
         EventRegistration.event_id == event_id,
-        EventRegistration.attendee_email == registration.attendee_email
+        EventRegistration.user_id == current_user.id
     ).first()
     
     if existing_registration:
@@ -641,9 +656,8 @@ async def register_for_event(
     db_registration = EventRegistration(
         event_id=event_id,
         user_id=current_user.id,
-        attendee_name=registration.attendee_name,
-        attendee_email=registration.attendee_email,
-        attendee_phone=registration.attendee_phone,
+        status="registered",
+        attendees=json.dumps(registration.attendees),
         number_of_attendees=registration.number_of_attendees
     )
     
@@ -698,31 +712,38 @@ async def mark_interest(
     ).first()
     
     if existing_registration:
-        # Remove interest
-        db.delete(existing_registration)
-        event.attendees_count = max(0, event.attendees_count - 1)
-        db.commit()
-        return {"message": "Interest removed successfully"}
-    else:
-        # Create a simple registration to mark interest
-        db_registration = EventRegistration(
-            event_id=event_id,
-            user_id=current_user.id,
-            attendee_name=current_user.username,
-            attendee_email=current_user.email,
-            attendee_phone=current_user.phone or "",
-            number_of_attendees=1
-        )
-        
-        db.add(db_registration)
-        event.attendees_count = event.attendees_count + 1
-        db.commit()
-        
-        return {"message": "Interest marked successfully"}
+        if existing_registration.status == "cancelled":
+            # Reactivate interest
+            existing_registration.status = "interested"
+            event.attendees_count = event.attendees_count + existing_registration.number_of_attendees
+            db.commit()
+            return {"message": "Interest marked successfully", "registration_id": existing_registration.id}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You are already interested or registered for this event"
+            )
+    
+    # Create a registration with "interested" status
+    db_registration = EventRegistration(
+        event_id=event_id,
+        user_id=current_user.id,
+        status="interested",
+        attendees=json.dumps([current_user.username]),
+        number_of_attendees=1
+    )
+    
+    db.add(db_registration)
+    event.attendees_count = event.attendees_count + 1
+    db.commit()
+    db.refresh(db_registration)
+    
+    return {"message": "Interest marked successfully", "registration_id": db_registration.id}
 
-@app.get("/events/{event_id}/registrations", response_model=List[EventRegistrationResponse])
-async def get_event_registrations(
+@app.post("/events/{event_id}/confirm-registration")
+async def confirm_registration(
     event_id: int,
+    registration_data: EventRegistrationCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -735,18 +756,138 @@ async def get_event_registrations(
             detail="Event not found"
         )
     
-    # Check if user is organizer or admin
-    if event.organizer_id != current_user.id and not current_user.is_admin:
+    # Check if registration period is open
+    now = datetime.utcnow()
+    if now < event.registration_start or now > event.registration_end:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to view registrations"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Registration is not open for this event"
         )
     
-    registrations = db.query(EventRegistration).filter(
-        EventRegistration.event_id == event_id
-    ).all()
+    # Get existing registration
+    registration = db.query(EventRegistration).filter(
+        EventRegistration.event_id == event_id,
+        EventRegistration.user_id == current_user.id
+    ).first()
     
-    return registrations
+    if not registration or registration.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You must first mark interest in this event"
+        )
+    
+    if registration.status == "registered":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You are already registered for this event"
+        )
+    
+    # Update registration
+    old_attendees_count = registration.number_of_attendees
+    registration.status = "registered"
+    registration.attendees = json.dumps(registration_data.attendees)
+    registration.number_of_attendees = registration_data.number_of_attendees
+    
+    # Update event attendees count
+    event.attendees_count = event.attendees_count - old_attendees_count + registration_data.number_of_attendees
+    
+    db.commit()
+    db.refresh(registration)
+    
+    # Create reminder notification
+    reminder_date = event.start_date - timedelta(days=1)
+    if reminder_date > now:
+        notification = Notification(
+            event_id=event.id,
+            user_id=current_user.id,
+            title="Event Reminder",
+            message=f"Reminder: The event '{event.title}' is tomorrow!",
+            notification_type="reminder"
+        )
+        db.add(notification)
+        db.commit()
+    
+    return registration
+
+@app.post("/events/{event_id}/cancel-registration")
+async def cancel_registration(
+    event_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Fetch registration
+    registration = db.query(EventRegistration).filter(
+        EventRegistration.event_id == event_id,
+        EventRegistration.user_id == current_user.id
+    ).first()
+    
+    if not registration or registration.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Registration not found"
+        )
+    
+    # Update event attendees count
+    event = registration.event
+    event.attendees_count = max(0, event.attendees_count - registration.number_of_attendees)
+    
+    # Update registration status
+    registration.status = "cancelled"
+    
+    db.commit()
+    
+    return {"message": "Registration cancelled successfully"}
+
+@app.get("/user/events/registered", response_model=List[EventResponse])
+async def get_user_registered_events(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    registrations = db.query(EventRegistration).filter(
+        EventRegistration.user_id == current_user.id,
+        EventRegistration.status == "registered"
+    ).all()
+    events = [registration.event for registration in registrations]
+    return events
+
+@app.get("/user/events/interested", response_model=List[EventResponse])
+async def get_user_interested_events(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    registrations = db.query(EventRegistration).filter(
+        EventRegistration.user_id == current_user.id,
+        EventRegistration.status == "interested"
+    ).all()
+    events = [registration.event for registration in registrations]
+    return events
+
+@app.get("/events/{event_id}/registration-status")
+async def get_registration_status(
+    event_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    registration = db.query(EventRegistration).filter(
+        EventRegistration.event_id == event_id,
+        EventRegistration.user_id == current_user.id
+    ).first()
+    
+    if not registration or registration.status == "cancelled":
+        return {
+            "status": "none",
+            "registration": None
+        }
+    
+    return {
+        "status": registration.status,
+        "registration": {
+            "id": registration.id,
+            "attendees": json.loads(registration.attendees),
+            "number_of_attendees": registration.number_of_attendees,
+            "registered_at": registration.registered_at
+        }
+    }
 
 # Admin endpoints
 @app.get("/admin/events/pending", response_model=List[EventResponse])
@@ -1011,6 +1152,44 @@ async def clerk_webhook(request: Request, db: Session = Depends(get_db)):
         return {"status": "success", "message": "User deletion handled"}
     
     return {"status": "success", "message": "Webhook received"}
+
+@app.get("/user/events/created", response_model=List[EventResponse])
+async def get_user_created_events(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    events = db.query(Event).filter(Event.organizer_id == current_user.id).all()
+    return events
+
+@app.get("/user/events/signedup", response_model=List[EventResponse])
+async def get_user_signedup_events(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    registrations = db.query(EventRegistration).filter(EventRegistration.user_id == current_user.id).all()
+    events = [registration.event for registration in registrations]
+    return events
+
+@app.get("/events/{event_id}/details", response_model=EventResponse)
+async def get_event_details(
+    event_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Check if user is registered
+    registration = db.query(EventRegistration).filter(
+        EventRegistration.event_id == event_id,
+        EventRegistration.user_id == current_user.id
+    ).first()
+    
+    # Add registration status to response
+    event_dict = EventResponse.model_validate(event).model_dump()
+    event_dict["is_registered"] = registration is not None
+    return event_dict
 
 if __name__ == "__main__":
     import uvicorn
