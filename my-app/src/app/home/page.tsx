@@ -27,12 +27,85 @@ const API_URL = "http://localhost:8000";
 export default function EventsPage() {
   const [searchTerm, setSearchTerm] = useState("");
   const [events, setEvents] = useState<any[]>([]);
+  const [registeredEvents, setRegisteredEvents] = useState<any[]>([]);
+  const [interestedEvents, setInterestedEvents] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [category, setCategory] = useState<string | null>(null);
   const { getToken, isLoaded, isSignedIn } = useAuth();
 
-  // Fetch events from the backend
+  // Fetch registered and interested events
+  useEffect(() => {
+    const fetchUserEvents = async () => {
+      if (!isSignedIn) return;
+
+      try {
+        const token = await getToken();
+
+        // Fetch registered events
+        const registeredResponse = await fetch(
+          `${API_URL}/user/events/registered`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+
+        // Fetch interested events
+        const interestedResponse = await fetch(
+          `${API_URL}/user/events/interested`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+
+        if (registeredResponse.ok && interestedResponse.ok) {
+          const registeredData = await registeredResponse.json();
+          const interestedData = await interestedResponse.json();
+
+          const formattedRegistered = registeredData.map((event: any) => ({
+            id: event.id,
+            title: event.title,
+            date: new Date(event.start_date).toISOString().split("T")[0],
+            location: event.location,
+            startTime: new Date(event.start_date).toTimeString().slice(0, 5),
+            endTime: new Date(event.end_date).toTimeString().slice(0, 5),
+            description: event.description,
+            category: event.category,
+            attendees: event.attendees_count,
+            image_path: event.image_path,
+            is_approved: event.is_approved,
+          }));
+
+          const formattedInterested = interestedData.map((event: any) => ({
+            id: event.id,
+            title: event.title,
+            date: new Date(event.start_date).toISOString().split("T")[0],
+            location: event.location,
+            startTime: new Date(event.start_date).toTimeString().slice(0, 5),
+            endTime: new Date(event.end_date).toTimeString().slice(0, 5),
+            description: event.description,
+            category: event.category,
+            attendees: event.attendees_count,
+            image_path: event.image_path,
+            is_approved: event.is_approved,
+          }));
+
+          setRegisteredEvents(formattedRegistered);
+          setInterestedEvents(formattedInterested);
+        }
+      } catch (error) {
+        console.error("Error fetching user events:", error);
+      }
+    };
+
+    fetchUserEvents();
+  }, [isSignedIn, getToken]);
+
+  // Fetch all events
   useEffect(() => {
     const fetchEvents = async () => {
       try {
@@ -49,51 +122,29 @@ export default function EventsPage() {
           `${API_URL}/events?${params.toString()}`
         );
 
-        // Format the events data to match the expected format
-        interface EventData {
-          id: number;
-          title: string;
-          start_date: string;
-          end_date: string;
-          location: string;
-          description: string;
-          category: string;
-          registrations?: any[];
-          image_path: string;
-          is_approved: boolean;
-        }
+        // Format the events data
+        const formattedEvents = response.data.map((event: any) => ({
+          id: event.id,
+          title: event.title,
+          date: new Date(event.start_date).toISOString().split("T")[0],
+          location: event.location,
+          startTime: new Date(event.start_date).toTimeString().slice(0, 5),
+          endTime: new Date(event.end_date).toTimeString().slice(0, 5),
+          description: event.description,
+          category: event.category,
+          attendees: event.attendees_count,
+          image_path: event.image_path,
+          is_approved: event.is_approved,
+        }));
 
-        interface FormattedEvent {
-          id: number;
-          title: string;
-          date: string;
-          location: string;
-          startTime: string;
-          endTime: string;
-          description: string;
-          category: string;
-          attendees: number;
-          image_path: string;
-          is_approved: boolean;
-        }
-
-        const formattedEvents: FormattedEvent[] = response.data.map(
-          (event: EventData) => ({
-            id: event.id,
-            title: event.title,
-            date: new Date(event.start_date).toISOString().split("T")[0],
-            location: event.location,
-            startTime: new Date(event.start_date).toTimeString().slice(0, 5),
-            endTime: new Date(event.end_date).toTimeString().slice(0, 5),
-            description: event.description,
-            category: event.category,
-            attendees: event.registrations?.length || 0,
-            image_path: event.image_path,
-            is_approved: event.is_approved,
-          })
+        // Filter out events that user is already registered for or interested in
+        const filteredEvents = formattedEvents.filter(
+          (event: any) =>
+            !registeredEvents.some((e) => e.id === event.id) &&
+            !interestedEvents.some((e) => e.id === event.id)
         );
 
-        setEvents(formattedEvents);
+        setEvents(filteredEvents);
         setError(null);
       } catch (err) {
         console.error("Error fetching events:", err);
@@ -103,9 +154,9 @@ export default function EventsPage() {
     };
 
     fetchEvents();
-  }, [category]);
+  }, [category, registeredEvents, interestedEvents]);
 
-  // Search events from backend
+  // Search events
   useEffect(() => {
     const searchEvents = async () => {
       if (!searchTerm || searchTerm.length < 2) {
@@ -120,50 +171,28 @@ export default function EventsPage() {
             `${API_URL}/events?${params.toString()}`
           );
 
-          interface EventData {
-            id: number;
-            title: string;
-            start_date: string;
-            end_date: string;
-            location: string;
-            description: string;
-            category: string;
-            registrations?: any[];
-            image_path: string;
-            is_approved: boolean;
-          }
+          const formattedEvents = response.data.map((event: any) => ({
+            id: event.id,
+            title: event.title,
+            date: new Date(event.start_date).toISOString().split("T")[0],
+            location: event.location,
+            startTime: new Date(event.start_date).toTimeString().slice(0, 5),
+            endTime: new Date(event.end_date).toTimeString().slice(0, 5),
+            description: event.description,
+            category: event.category,
+            attendees: event.attendees_count,
+            image_path: event.image_path,
+            is_approved: event.is_approved,
+          }));
 
-          interface FormattedEvent {
-            id: number;
-            title: string;
-            date: string;
-            location: string;
-            startTime: string;
-            endTime: string;
-            description: string;
-            category: string;
-            attendees: number;
-            image_path: string;
-            is_approved: boolean;
-          }
-
-          const formattedEvents: FormattedEvent[] = response.data.map(
-            (event: EventData) => ({
-              id: event.id,
-              title: event.title,
-              date: new Date(event.start_date).toISOString().split("T")[0],
-              location: event.location,
-              startTime: new Date(event.start_date).toTimeString().slice(0, 5),
-              endTime: new Date(event.end_date).toTimeString().slice(0, 5),
-              description: event.description,
-              category: event.category,
-              attendees: event.registrations?.length || 0,
-              image_path: event.image_path,
-              is_approved: event.is_approved,
-            })
+          // Filter out events that user is already registered for or interested in
+          const filteredEvents = formattedEvents.filter(
+            (event: any) =>
+              !registeredEvents.some((e) => e.id === event.id) &&
+              !interestedEvents.some((e) => e.id === event.id)
           );
 
-          setEvents(formattedEvents);
+          setEvents(filteredEvents);
         } catch (err) {
           console.error("Error fetching events:", err);
         }
@@ -175,62 +204,35 @@ export default function EventsPage() {
           `${API_URL}/search?query=${encodeURIComponent(searchTerm)}`
         );
 
-        interface SearchEventData {
-          id: number;
-          title: string;
-          start_date: string;
-          end_date: string;
-          location: string;
-          description: string;
-          category: string;
-          registrations?: any[];
-          image_path: string;
-          is_approved: boolean;
-        }
+        const formattedEvents = response.data.map((event: any) => ({
+          id: event.id,
+          title: event.title,
+          date: new Date(event.start_date).toISOString().split("T")[0],
+          location: event.location,
+          startTime: new Date(event.start_date).toTimeString().slice(0, 5),
+          endTime: new Date(event.end_date).toTimeString().slice(0, 5),
+          description: event.description,
+          category: event.category,
+          attendees: event.attendees_count,
+          image_path: event.image_path,
+          is_approved: event.is_approved,
+        }));
 
-        interface FormattedSearchEvent {
-          id: number;
-          title: string;
-          date: string;
-          location: string;
-          startTime: string;
-          endTime: string;
-          description: string;
-          category: string;
-          attendees: number;
-          image_path: string;
-          is_approved: boolean;
-        }
-
-        const formattedEvents: FormattedSearchEvent[] = response.data.map(
-          (event: SearchEventData) => ({
-            id: event.id,
-            title: event.title,
-            date: new Date(event.start_date).toISOString().split("T")[0],
-            location: event.location,
-            startTime: new Date(event.start_date).toTimeString().slice(0, 5),
-            endTime: new Date(event.end_date).toTimeString().slice(0, 5),
-            description: event.description,
-            category: event.category,
-            attendees: event.registrations?.length || 0,
-            image_path: event.image_path,
-            is_approved: event.is_approved,
-          })
+        // Filter out events that user is already registered for or interested in
+        const filteredEvents = formattedEvents.filter(
+          (event: any) =>
+            !registeredEvents.some((e) => e.id === event.id) &&
+            !interestedEvents.some((e) => e.id === event.id)
         );
 
-        setEvents(formattedEvents);
+        setEvents(filteredEvents);
       } catch (err) {
         console.error("Error searching events:", err);
       }
     };
 
-    // Debounce search to avoid too many requests
-    const timeoutId = setTimeout(() => {
-      searchEvents();
-    }, 500);
-
-    return () => clearTimeout(timeoutId);
-  }, [searchTerm, category]);
+    searchEvents();
+  }, [searchTerm, category, registeredEvents, interestedEvents]);
 
   // Setup axios interceptor to add auth token to requests
   useEffect(() => {
@@ -324,16 +326,6 @@ export default function EventsPage() {
       console.error("Error marking interest:", err);
     }
   };
-  // Filter events based on search term (client-side filtering as backup)
-  const filteredEvents =
-    searchTerm.length > 0
-      ? events.filter(
-          (event) =>
-            event.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
-            event.location.toLowerCase().includes(searchTerm.toLowerCase()) ||
-            event.category.toLowerCase().includes(searchTerm.toLowerCase())
-        )
-      : events;
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -479,37 +471,36 @@ export default function EventsPage() {
           </div>
         </div>
 
-        <div className="flex justify-between items-center mb-6">
-          <h1 className="text-2xl font-bold">
-            {category ? `${category} Events` : "Upcoming Events"}
-          </h1>
-          <SignedIn>
-            <Link href="/addevent">
-              <Button className="md:hidden flex items-center gap-2">
-                <PlusCircle size={16} />
-                Create Event
-              </Button>
-            </Link>
-          </SignedIn>
-        </div>
+        <div className="space-y-8">
+          {isSignedIn && registeredEvents.length > 0 && (
+            <div>
+              <h2 className="text-2xl font-bold mb-4">
+                Your Registered Events
+              </h2>
+              <EventCardsGrid
+                events={registeredEvents}
+                showInterestButton={false}
+              />
+            </div>
+          )}
 
-        {loading ? (
-          <div className="flex justify-center items-center h-64">
-            <p className="text-lg">Loading events...</p>
+          {isSignedIn && interestedEvents.length > 0 && (
+            <div>
+              <h2 className="text-2xl font-bold mb-4">
+                Events You're Interested In
+              </h2>
+              <EventCardsGrid
+                events={interestedEvents}
+                showInterestButton={false}
+              />
+            </div>
+          )}
+
+          <div>
+            <h2 className="text-2xl font-bold mb-4">Upcoming Events</h2>
+            <EventCardsGrid events={events} onInterest={markInterest} />
           </div>
-        ) : error ? (
-          <div className="flex justify-center items-center h-64">
-            <p className="text-lg text-red-500">{error}</p>
-          </div>
-        ) : filteredEvents.length === 0 ? (
-          <div className="flex justify-center items-center h-64">
-            <p className="text-lg">
-              No events found. Try a different search or category.
-            </p>
-          </div>
-        ) : (
-          <EventCardsGrid events={filteredEvents} onInterest={markInterest} />
-        )}
+        </div>
       </main>
     </div>
   );

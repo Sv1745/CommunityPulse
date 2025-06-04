@@ -97,7 +97,7 @@ class Event(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, index=True)
     description = Column(Text)
-    location = Column(String)
+    location = Column(Text)  # This will store the formatted address
     category = Column(String, index=True)
     start_date = Column(DateTime, index=True)
     end_date = Column(DateTime, index=True)
@@ -380,7 +380,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 async def create_event(
     title: str = Form(...),
     description: str = Form(...),
-    location: str = Form(...),
+    location: str = Form(...),  # This will receive the formatted address from frontend
     category: str = Form(...),
     start_date: str = Form(...),
     end_date: str = Form(...),
@@ -715,7 +715,7 @@ async def mark_interest(
         if existing_registration.status == "cancelled":
             # Reactivate interest
             existing_registration.status = "interested"
-            event.attendees_count = event.attendees_count + existing_registration.number_of_attendees
+            event.attendees_count = event.attendees_count + 1  # Add 1 for interested status
             db.commit()
             return {"message": "Interest marked successfully", "registration_id": existing_registration.id}
         else:
@@ -730,11 +730,11 @@ async def mark_interest(
         user_id=current_user.id,
         status="interested",
         attendees=json.dumps([current_user.username]),
-        number_of_attendees=1
+        number_of_attendees=1  # Start with 1 for interested status
     )
     
     db.add(db_registration)
-    event.attendees_count = event.attendees_count + 1
+    event.attendees_count = event.attendees_count + 1  # Add 1 for interested status
     db.commit()
     db.refresh(db_registration)
     
@@ -758,7 +758,18 @@ async def confirm_registration(
     
     # Check if registration period is open
     now = datetime.utcnow()
-    if now < event.registration_start or now > event.registration_end:
+    # Add a buffer time of 24 hours to account for timezone differences
+    buffer_time = timedelta(hours=24)
+    registration_start_with_buffer = event.registration_start - buffer_time
+    registration_end_with_buffer = event.registration_end + buffer_time
+    
+    logger.info(f"Registration period check for event {event_id}:")
+    logger.info(f"Current time (UTC): {now}")
+    logger.info(f"Registration start (with buffer): {registration_start_with_buffer}")
+    logger.info(f"Registration end (with buffer): {registration_end_with_buffer}")
+    
+    if now < registration_start_with_buffer or now > registration_end_with_buffer:
+        logger.warning(f"Registration not open. Current time: {now}, Registration period (with buffer): {registration_start_with_buffer} to {registration_end_with_buffer}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Registration is not open for this event"
@@ -789,7 +800,10 @@ async def confirm_registration(
     registration.number_of_attendees = registration_data.number_of_attendees
     
     # Update event attendees count
-    event.attendees_count = event.attendees_count - old_attendees_count + registration_data.number_of_attendees
+    # First subtract the old count (from "interested" status)
+    event.attendees_count = event.attendees_count - old_attendees_count
+    # Then add the new count
+    event.attendees_count = event.attendees_count + registration_data.number_of_attendees
     
     db.commit()
     db.refresh(registration)
